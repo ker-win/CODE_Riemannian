@@ -52,11 +52,75 @@ sys.path.append(str(BASE_DIR / "CODE"))
 from datasets.factory import get_dataset
 
 
+def _stageA_score_riemann(covs: np.ndarray, y: np.ndarray, eps: float = 1e-9) -> float:
+    """
+    Stage A: 使用黎曼距離計算 (T,B) 組合的可分性分數
+    
+    score = between_class_distance / (within_class_distance + eps)
+    
+    Parameters
+    ----------
+    covs : np.ndarray
+        協方差矩陣 (n_trials, Nc, Nc)
+    y : np.ndarray
+        標籤
+    eps : float
+        避免除以零
+        
+    Returns
+    -------
+    float
+        可分性分數 (越高越好)
+    """
+    from pyriemann.utils.mean import mean_riemann
+    from pyriemann.utils.distance import distance_riemann
+    
+    classes = np.unique(y)
+    
+    # 計算每個類別的黎曼均值和類內距離
+    means = []
+    within = 0.0
+    
+    for c in classes:
+        cov_c = covs[y == c]
+        if len(cov_c) < 2:
+            # 樣本太少，跳過
+            continue
+        try:
+            m_c = mean_riemann(cov_c)
+            means.append(m_c)
+            # 類內距離：樣本到類均值的平均黎曼距離
+            dists = [distance_riemann(cov_c[i], m_c) for i in range(len(cov_c))]
+            within += np.mean(dists)
+        except Exception:
+            # 計算失敗時使用歐式距離
+            m_c = np.mean(cov_c, axis=0)
+            means.append(m_c)
+            within += np.mean([np.linalg.norm(cov_c[i] - m_c) for i in range(len(cov_c))])
+    
+    if len(means) < 2:
+        return 0.0
+    
+    within /= len(classes)
+    
+    # 類間距離：類均值之間的平均黎曼距離
+    between_vals = []
+    for i in range(len(means)):
+        for j in range(i + 1, len(means)):
+            try:
+                between_vals.append(distance_riemann(means[i], means[j]))
+            except Exception:
+                between_vals.append(np.linalg.norm(means[i] - means[j]))
+    
+    between = float(np.mean(between_vals)) if between_vals else 0.0
+    
+    return between / (within + eps)
+
 def run_riemannian_classification(
     dataset_name: str = 'BCICIV_2a',
     n_folds: int = 5,
-    top_k_combinations: int = 50,
-    nca_components: int = 30,
+    top_k_combinations: int = None,
+    nca_components: int = None,
     verbose: bool = True
 ) -> dict:
     """
@@ -68,10 +132,10 @@ def run_riemannian_classification(
         資料集名稱
     n_folds : int
         交叉驗證折數
-    top_k_combinations : int
-        選取的 (T,B) 組合數量
-    nca_components : int
-        NCA 降維維度
+    top_k_combinations : int, optional
+        選取的 (T,B) 組合數量，預設從 config 讀取
+    nca_components : int, optional
+        NCA 降維維度，預設從 config 讀取
     verbose : bool
         是否輸出詳細資訊
         
@@ -80,6 +144,12 @@ def run_riemannian_classification(
     dict
         包含每位受試者結果
     """
+    # 從 config 讀取預設值
+    if top_k_combinations is None:
+        top_k_combinations = DEFAULT_RIEMANNIAN.top_k_combinations
+    if nca_components is None:
+        nca_components = DEFAULT_RIEMANNIAN.nca_n_components
+    
     if verbose:
         print(f"\n{'='*60}")
         print(f"資料集: {dataset_name}")
@@ -177,15 +247,17 @@ def run_riemannian_classification(
                         train_covs_list.append(train_cov)
                         test_covs_list.append(test_cov)
                 
-                # 3. 粗篩 top-K (B, T) 組合
+                # 3. 粗篩 top-K (B, T) 組合 (使用黎曼距離)
+                from pyriemann.utils.mean import mean_riemann
+                from pyriemann.utils.distance import distance_riemann
+                
                 n_combs = len(train_covs_list)
                 comb_scores = []
                 
                 for comb_idx in range(n_combs):
                     covs = train_covs_list[comb_idx]
-                    class0_mean = np.mean(covs[y_train == 0], axis=0)
-                    class1_mean = np.mean(covs[y_train == 1], axis=0)
-                    score = np.linalg.norm(class0_mean - class1_mean)
+                    # 使用黎曼距離計算可分性分數
+                    score = _stageA_score_riemann(covs, y_train)
                     comb_scores.append(score)
                 
                 top_k = min(top_k_combinations, n_combs)
@@ -211,15 +283,33 @@ def run_riemannian_classification(
                 X_train_feat = np.hstack(train_features)
                 X_test_feat = np.hstack(test_features)
                 
-                # 5. NCA + SVM
-                clf = RiemannianSVMClassifier(
-                    nca_components=nca_components,
-                    nca_max_iter=DEFAULT_RIEMANNIAN.nca_max_iter,
-                    svm_C=1.0,
-                    svm_kernel='linear'
-                )
-                clf.fit(X_train_feat, y_train)
-                y_pred = clf.predict(X_test_feat)
+                # 5. NCA + SVM (with grid search for C)
+                from sklearn.model_selection import GridSearchCV
+                from sklearn.svm import SVC
+                from sklearn.preprocessing import StandardScaler
+                from sklearn.pipeline import Pipeline
+                from sklearn.neighbors import NeighborhoodComponentsAnalysis
+                
+                # 建立 Pipeline
+                n_comp = min(nca_components, X_train_feat.shape[1] - 1, X_train_feat.shape[0] - 1)
+                n_comp = max(1, n_comp)
+                
+                pipe = Pipeline([
+                    ('scaler', StandardScaler()),
+                    ('nca', NeighborhoodComponentsAnalysis(
+                        n_components=n_comp,
+                        max_iter=DEFAULT_RIEMANNIAN.nca_max_iter,
+                        random_state=42
+                    )),
+                    ('svm', SVC(kernel='linear', random_state=42))
+                ])
+                
+                # Grid search for SVM C
+                param_grid = {'svm__C': [0.01, 0.1, 1, 10, 100]}
+                grid = GridSearchCV(pipe, param_grid, cv=3, n_jobs=-1, scoring='accuracy')
+                grid.fit(X_train_feat, y_train)
+                
+                y_pred = grid.predict(X_test_feat)
                 
                 fold_accuracies.append(accuracy_score(y_test, y_pred))
             
