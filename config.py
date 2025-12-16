@@ -60,8 +60,12 @@ class RiemannianConfig:
     # Stage A: 粗篩 top-K (T,B) 組合
     top_k_combinations: int = 50  # 從 512 個 (T,B) 組合中選 top-K
     
+    # 協方差估計器: 'scm', 'lwf', 'oas' (shrinkage 更穩定)
+    cov_estimator: str = 'oas'
+    
     # 特徵選擇
-    nca_n_components: int = 30  # NCA 降維後的維度
+    nca_n_components: int = 128  # NCA 降維後的維度 (原本 30 太低)
+    nca_max_iter: int = 500  # NCA 最大迭代次數
     
 DEFAULT_RIEMANNIAN = RiemannianConfig()
 

@@ -23,7 +23,7 @@ class NCAFeatureSelector:
     使用 NCA 學習投影矩陣，並根據特徵重要度選擇 top-K 特徵
     """
     
-    def __init__(self, n_components: int = 30, random_state: int = 42):
+    def __init__(self, n_components: int = 30, max_iter: int = 500, random_state: int = 42):
         """
         初始化
         
@@ -31,10 +31,13 @@ class NCAFeatureSelector:
         ----------
         n_components : int
             NCA 降維後的維度
+        max_iter : int
+            NCA 最大迭代次數
         random_state : int
             隨機種子
         """
         self.n_components = n_components
+        self.max_iter = max_iter
         self.random_state = random_state
         self.nca_ = None
         self.scaler_ = None
@@ -68,7 +71,7 @@ class NCAFeatureSelector:
         self.nca_ = NeighborhoodComponentsAnalysis(
             n_components=n_components,
             random_state=self.random_state,
-            max_iter=100
+            max_iter=self.max_iter
         )
         
         try:
@@ -123,7 +126,8 @@ class RiemannianSVMClassifier:
     
     def __init__(
         self,
-        nca_components: int = 30,
+        nca_components: int = 128,
+        nca_max_iter: int = 500,
         svm_C: float = 1.0,
         svm_kernel: str = 'linear',
         random_state: int = 42
@@ -135,6 +139,8 @@ class RiemannianSVMClassifier:
         ----------
         nca_components : int
             NCA 降維維度
+        nca_max_iter : int
+            NCA 最大迭代次數
         svm_C : float
             SVM 正則化參數
         svm_kernel : str
@@ -143,6 +149,7 @@ class RiemannianSVMClassifier:
             隨機種子
         """
         self.nca_components = nca_components
+        self.nca_max_iter = nca_max_iter
         self.svm_C = svm_C
         self.svm_kernel = svm_kernel
         self.random_state = random_state
@@ -168,6 +175,7 @@ class RiemannianSVMClassifier:
         # NCA
         self.nca_ = NCAFeatureSelector(
             n_components=self.nca_components,
+            max_iter=self.nca_max_iter,
             random_state=self.random_state
         )
         X_nca = self.nca_.fit_transform(X, y)

@@ -140,30 +140,44 @@ def run_riemannian_classification(
                 X_train, X_test = X[train_idx], X[test_idx]
                 y_train, y_test = y[train_idx], y[test_idx]
                 
-                # 1. 多時間窗口切分
+                # ============================================
+                # 修正：先濾波再切窗 (避免短窗低頻濾波邊界效應)
+                # ============================================
+                from preprocessing.filterbank import FilterBank
+                from pyriemann.estimation import Covariances
+                from pyriemann.tangentspace import TangentSpace
+                
+                fb = FilterBank(bands=FILTER_BANDS)
+                
+                # 1. 先對完整資料做濾波器組
+                train_bands = fb.transform(X_train, sfreq)  # List[np.ndarray], 64 個頻帶
+                test_bands = fb.transform(X_test, sfreq)
+                
+                # 2. 對每個頻帶的資料切時間窗口
                 segmenter = MultiWindowSegmenter()
-                train_windows = segmenter.transform(X_train, sfreq)
-                test_windows = segmenter.transform(X_test, sfreq)
+                n_bands = len(train_bands)
+                n_windows = segmenter.n_windows
                 
-                # 2. 濾波器組 (對每個時間窗口)
-                train_filtered = apply_filterbank_to_windows(train_windows, sfreq, FILTER_BANDS)
-                test_filtered = apply_filterbank_to_windows(test_windows, sfreq, FILTER_BANDS)
-                
-                # 3. 計算協方差矩陣 (對每個 T,B 組合)
-                n_windows = len(train_filtered)
-                n_bands = len(train_filtered[0]) if n_windows > 0 else 0
-                
+                # 收集所有 (B, T) 組合的協方差
                 train_covs_list = []
                 test_covs_list = []
                 
-                for w_idx in range(n_windows):
-                    for b_idx in range(n_bands):
-                        train_cov = compute_covariance(train_filtered[w_idx][b_idx])
-                        test_cov = compute_covariance(test_filtered[w_idx][b_idx])
+                # 使用 shrinkage 估計器 (oas 更穩定)
+                cov_estimator = Covariances(estimator=DEFAULT_RIEMANNIAN.cov_estimator)
+                
+                for b_idx in range(n_bands):
+                    # 對該頻帶切時間窗口
+                    train_windows = segmenter.transform(train_bands[b_idx], sfreq)
+                    test_windows = segmenter.transform(test_bands[b_idx], sfreq)
+                    
+                    for w_idx in range(n_windows):
+                        # 計算協方差 (使用 pyriemann)
+                        train_cov = cov_estimator.fit_transform(train_windows[w_idx])
+                        test_cov = cov_estimator.transform(test_windows[w_idx])
                         train_covs_list.append(train_cov)
                         test_covs_list.append(test_cov)
                 
-                # 4. 粗篩 top-K (T,B) 組合
+                # 3. 粗篩 top-K (B, T) 組合
                 n_combs = len(train_covs_list)
                 comb_scores = []
                 
@@ -177,7 +191,7 @@ def run_riemannian_classification(
                 top_k = min(top_k_combinations, n_combs)
                 top_indices = np.argsort(comb_scores)[-top_k:]
                 
-                # 5. 對選中的組合做切空間投影
+                # 4. 對選中的組合做切空間投影 (使用 pyriemann TangentSpace)
                 train_features = []
                 test_features = []
                 
@@ -185,11 +199,10 @@ def run_riemannian_classification(
                     train_cov = train_covs_list[comb_idx]
                     test_cov = test_covs_list[comb_idx]
                     
-                    ref = np.mean(train_cov, axis=0)
-                    ref = ref + 1e-6 * np.eye(ref.shape[0])
-                    
-                    train_tangent = _project_to_tangent(train_cov, ref)
-                    test_tangent = _project_to_tangent(test_cov, ref)
+                    # 使用 pyriemann TangentSpace (正確的黎曼均值 + 切空間投影)
+                    ts = TangentSpace(metric='riemann')
+                    train_tangent = ts.fit_transform(train_cov)  # 只用 train 計算 reference
+                    test_tangent = ts.transform(test_cov)
                     
                     train_features.append(train_tangent)
                     test_features.append(test_tangent)
@@ -198,9 +211,10 @@ def run_riemannian_classification(
                 X_train_feat = np.hstack(train_features)
                 X_test_feat = np.hstack(test_features)
                 
-                # 6. NCA + SVM
+                # 5. NCA + SVM
                 clf = RiemannianSVMClassifier(
                     nca_components=nca_components,
+                    nca_max_iter=DEFAULT_RIEMANNIAN.nca_max_iter,
                     svm_C=1.0,
                     svm_kernel='linear'
                 )
